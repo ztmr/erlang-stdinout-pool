@@ -12,7 +12,7 @@
 % oneshot callback
 -export([handle_oneshot/1]).
 
--record(state, {cmd, ip, port, available, reserved, count, forcer}).
+-record(state, {cmd, ip, port, available, reserved, count, forcer, ttl}).
 
 %%====================================================================
 %% api callbacks
@@ -59,8 +59,10 @@ count_cpus([{processor, _} | T], Count) ->
 init([Cmd, IP, Port, SocketCount]) ->
   process_flag(trap_exit, true),
   Forcer = get_base_dir(?MODULE) ++ "/priv/stdin_forcer",
+  Timeout = application:get_env(stdinout_pool, ttl, 300000),
   initial_setup(#state{cmd = Cmd, forcer = Forcer,
-                       ip = IP, port = Port, count = SocketCount}).
+                       ip = IP, port = Port, count = SocketCount,
+                       ttl = Timeout}).
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -78,13 +80,13 @@ handle_call({stdin, Content}, From, #state{available = []} = State) ->
   NewAvail = [setup(State)],
   handle_call({stdin, Content}, From, State#state{available = NewAvail});
 
-handle_call({stdin, Content}, From, #state{available = [H|T]} = State) ->
+handle_call({stdin, Content}, From, #state{available = [H|T], ttl = Ttl} = State) ->
   % quickly spawn so we can be a non-blocking gen_server:
   spawn(fun() ->
           port_connect(H, self()),   % attach port to this spawned process
           port_command(H, Content),  % send our stdin content to the wrapper
           port_command(H, <<0>>),    % tell the wrapper we're done
-          gen_server:reply(From, gather_response(H)),
+          gen_server:reply(From, gather_response(H, Ttl)),
           port_close(H)
         end),
   {noreply, State#state{available = T}};
@@ -93,14 +95,14 @@ handle_call(reload, _From, #state{available = Running} = State) ->
   [port_close(R) || R <- Running],
   {reply, ok, State#state{available = []}}.
  
-gather_response(Port) ->
-  gather_response(Port, []).
-gather_response(Port, Accum) ->
+gather_response(Port, Ttl) ->
+  gather_response(Port, Ttl, []).
+gather_response(Port, Ttl, Accum) ->
   receive
-    {Port, {data, Bin}} -> gather_response(Port, [Bin | Accum]);
+    {Port, {data, Bin}} -> gather_response(Port, Ttl, [Bin | Accum]);
     {Port, eof} -> lists:reverse(Accum)
-  after % max 30 seconds of time for the process to send EOF (close stdout)
-    30000 -> {died, lists:reverse(Accum)}
+  after % max @TTL seconds of time for the process to send EOF (close stdout)
+    Ttl -> {died, lists:reverse(Accum)}
   end.
 
 %%--------------------------------------------------------------------
